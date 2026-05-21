@@ -2,7 +2,7 @@ import AppKit
 import Foundation
 import UserNotifications
 
-enum TrackedAsset: String, CaseIterable {
+enum TrackedAsset: String, CaseIterable, Codable, Hashable, Sendable {
     case btc = "BTCUSDT"
     case eth = "ETHUSDT"
     case bnb = "BNBUSDT"
@@ -46,8 +46,6 @@ struct PriceAlertRule: Codable {
     }
 }
 
-extension TrackedAsset: Codable {}
-
 struct TickerResponse: Decodable {
     let symbol: String
     let price: String
@@ -80,6 +78,61 @@ struct GateTickerResponse: Decodable {
 struct PriceQuote {
     let price: Double
     let source: String
+}
+
+struct AssetFetchResult: Sendable {
+    let rawAsset: String
+    let price: Double?
+    let source: String?
+    let errorMessage: String?
+}
+
+enum ErrorDescription {
+    static func describe(_ error: Error) -> String {
+        if let localized = error as? LocalizedError, let description = localized.errorDescription {
+            return description
+        }
+        if let urlError = error as? URLError {
+            return urlError.localizedDescription
+        }
+        if let decodingError = error as? DecodingError {
+            return "\(decodingError)"
+        }
+        return String(describing: error)
+    }
+}
+
+enum AppLog {
+    private static let url = URL(fileURLWithPath: "/private/tmp/CryptoTickerBar.log")
+    private static let queue = DispatchQueue(label: "CryptoTickerBar.AppLog")
+
+    static func write(_ message: String) {
+        let line = "[\(timestamp())] \(message)\n"
+        queue.async {
+            guard let data = line.data(using: .utf8) else {
+                return
+            }
+
+            if !FileManager.default.fileExists(atPath: url.path) {
+                FileManager.default.createFile(atPath: url.path, contents: nil)
+            }
+
+            do {
+                let handle = try FileHandle(forWritingTo: url)
+                try handle.seekToEnd()
+                try handle.write(contentsOf: data)
+                try handle.close()
+            } catch {
+                NSLog("CryptoTickerBar log write failed: \(error)")
+            }
+        }
+    }
+
+    private static func timestamp() -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: Date())
+    }
 }
 
 struct AppSettings {
@@ -171,10 +224,21 @@ final class SettingsStore {
 }
 
 final class PriceService {
-    enum PriceError: Error {
+    enum PriceError: Error, LocalizedError {
         case badURL
         case missingPrice
-        case allSourcesFailed
+        case allSourcesFailed(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .badURL:
+                return "Bad request URL"
+            case .missingPrice:
+                return "Missing price in response"
+            case .allSourcesFailed(let details):
+                return details.isEmpty ? "All price sources failed" : details
+            }
+        }
     }
 
     private let session: URLSession
@@ -183,20 +247,35 @@ final class PriceService {
     init(session: URLSession = .shared) {
         self.session = session
         self.providers = [
+            GatePriceProvider(session: session),
             OKXPriceProvider(session: session),
             MEXCPriceProvider(session: session),
-            GatePriceProvider(session: session),
             BinancePriceProvider(session: session)
         ]
     }
 
     func fetchPrice(for asset: TrackedAsset) async throws -> PriceQuote {
+        var failures: [String] = []
         for provider in providers {
-            if let price = try? await provider.fetchPrice(for: asset) {
+            let startedAt = Date()
+            AppLog.write("price.start asset=\(asset.displayName) provider=\(provider.name)")
+            do {
+                let price = try await provider.fetchPrice(for: asset)
+                let elapsed = Date().timeIntervalSince(startedAt)
+                AppLog.write("price.success asset=\(asset.displayName) provider=\(provider.name) price=\(price) elapsed=\(String(format: "%.3f", elapsed))s")
                 return PriceQuote(price: price, source: provider.name)
+            } catch {
+                let description = describe(error)
+                let elapsed = Date().timeIntervalSince(startedAt)
+                AppLog.write("price.failure asset=\(asset.displayName) provider=\(provider.name) error=\(description) elapsed=\(String(format: "%.3f", elapsed))s")
+                failures.append("\(provider.name): \(description)")
             }
         }
-        throw PriceError.allSourcesFailed
+        throw PriceError.allSourcesFailed(failures.joined(separator: "; "))
+    }
+
+    private func describe(_ error: Error) -> String {
+        ErrorDescription.describe(error)
     }
 }
 
@@ -208,7 +287,7 @@ protocol PriceProvider {
 extension PriceProvider {
     func requestData(from url: URL, session: URLSession) async throws -> Data {
         var request = URLRequest(url: url)
-        request.timeoutInterval = 6
+        request.timeoutInterval = 3
         request.cachePolicy = .reloadIgnoringLocalCacheData
 
         let (data, response) = try await session.data(for: request)
@@ -808,6 +887,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSUserNotificationCent
     private var timer: Timer?
     private var latestPrices: [TrackedAsset: Double] = [:]
     private var latestSources: [TrackedAsset: String] = [:]
+    private var latestErrors: [TrackedAsset: String] = [:]
+    private var isFetching = false
     private var alertStatusResetWorkItem: DispatchWorkItem?
     private var settingsWindowController: SettingsWindowController?
 
@@ -817,6 +898,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSUserNotificationCent
         UNUserNotificationCenter.current().delegate = self
         notificationSender.requestAuthorizationIfNeeded()
         settings = settingsStore.load()
+        AppLog.write("app.launch assets=\(settings.assets.map(\.displayName).joined(separator: ",")) refresh=\(settings.refreshInterval)")
         configureMenu()
         updateStatusTitle("Loading")
         schedulePolling()
@@ -854,40 +936,79 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSUserNotificationCent
     }
 
     private func fetchNow() {
+        guard !isFetching else {
+            AppLog.write("fetch.skip reason=in_progress")
+            return
+        }
+        isFetching = true
         let assets = monitoredAssets()
+        let priceService = self.priceService
+        AppLog.write("fetch.begin assets=\(assets.map(\.displayName).joined(separator: ","))")
 
-        Task { [weak self] in
-            guard let self else {
+        Task<Void, Never> { [weak self] in
+            let completedResults = await Self.fetchPrices(for: assets, priceService: priceService)
+            guard let appDelegate = self else {
                 return
             }
-
-            await withTaskGroup(of: (TrackedAsset, Result<PriceQuote, Error>).self) { group in
-                for asset in assets {
-                    group.addTask {
-                        do {
-                            return (asset, .success(try await self.priceService.fetchPrice(for: asset)))
-                        } catch {
-                            return (asset, .failure(error))
-                        }
-                    }
-                }
-
-                for await (asset, result) in group {
-                    await MainActor.run {
-                        switch result {
-                        case .success(let quote):
-                            self.latestPrices[asset] = quote.price
-                            self.latestSources[asset] = quote.source
-                            self.evaluateAlerts(asset: asset, price: quote.price)
-                        case .failure:
-                            self.latestPrices.removeValue(forKey: asset)
-                            self.latestSources.removeValue(forKey: asset)
-                        }
-                        self.updateStatusTitle(self.statusText())
-                    }
-                }
+            await MainActor.run {
+                appDelegate.applyFetchResults(completedResults)
             }
         }
+    }
+
+    private static func fetchPrices(for assets: [TrackedAsset], priceService: PriceService) async -> [AssetFetchResult] {
+        var results: [AssetFetchResult] = []
+        for asset in assets {
+            do {
+                let quote = try await priceService.fetchPrice(for: asset)
+                let result = AssetFetchResult(
+                    rawAsset: asset.rawValue,
+                    price: quote.price,
+                    source: quote.source,
+                    errorMessage: nil
+                )
+                AppLog.write("fetch.collect rawAsset=\(result.rawAsset) price=\(String(quote.price)) error=")
+                results.append(result)
+            } catch {
+                let errorMessage = ErrorDescription.describe(error)
+                let result = AssetFetchResult(
+                    rawAsset: asset.rawValue,
+                    price: nil,
+                    source: nil,
+                    errorMessage: errorMessage
+                )
+                AppLog.write("fetch.collect rawAsset=\(result.rawAsset) price=nil error=\(errorMessage)")
+                results.append(result)
+            }
+        }
+        return results
+    }
+
+    private func applyFetchResults(_ results: [AssetFetchResult]) {
+        for result in results {
+            let rawAsset = result.rawAsset
+            guard let asset = TrackedAsset(rawValue: rawAsset) else {
+                AppLog.write("fetch.result.skip rawAsset=\(rawAsset) reason=unknown_asset")
+                continue
+            }
+            let priceText = result.price.map { String($0) } ?? "nil"
+            let errorText = result.errorMessage ?? ""
+            AppLog.write("fetch.result asset=\(asset.displayName) rawAsset=\(rawAsset) price=\(priceText) error=\(errorText)")
+            if let price = result.price, let source = result.source {
+                latestPrices[asset] = price
+                latestSources[asset] = source
+                latestErrors.removeValue(forKey: asset)
+                evaluateAlerts(asset: asset, price: price)
+            } else {
+                latestPrices.removeValue(forKey: asset)
+                latestSources.removeValue(forKey: asset)
+                latestErrors[asset] = result.errorMessage ?? "Unknown price error"
+            }
+        }
+        isFetching = false
+        let title = statusText()
+        AppLog.write("fetch.end title=\(title) prices=\(latestPrices.map { "\($0.key.displayName)=\($0.value)" }.joined(separator: ",")) errors=\(latestErrors.map { "\($0.key.displayName)=\($0.value)" }.joined(separator: " | "))")
+        updateStatusTitle(title)
     }
 
     private func evaluateAlerts(asset: TrackedAsset, price: Double) {
@@ -961,10 +1082,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSUserNotificationCent
                 return
             }
             self.settings = next
+            AppLog.write("settings.save assets=\(next.assets.map(\.displayName).joined(separator: ",")) refresh=\(next.refreshInterval)")
             self.settingsStore.save(next)
             let monitored = self.monitoredAssets(settings: next)
             self.latestPrices = self.latestPrices.filter { monitored.contains($0.key) }
             self.latestSources = self.latestSources.filter { monitored.contains($0.key) }
+            self.latestErrors = self.latestErrors.filter { monitored.contains($0.key) }
             self.alertState.reset()
             self.schedulePolling()
             self.fetchNow()
@@ -992,6 +1115,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSUserNotificationCent
             }
             if let source = latestSources[asset] {
                 lines.append("\(asset.displayName) source: \(source)")
+            }
+            if let error = latestErrors[asset] {
+                lines.append("\(asset.displayName) error: \(error)")
             }
         }
         for rule in settings.alertRules {
